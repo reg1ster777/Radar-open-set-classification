@@ -88,7 +88,7 @@ class SimplifiedSolver:
             print(f">>> Epoch {epoch+1}/{epochs}: Avg Loss = {avg_loss:.6f}")
             if test == True:
                 self.test_epoch(test_loader, epoch+1)
-        
+
         self.save_model()
         print("=== 训练结束 ===")
 
@@ -174,25 +174,33 @@ class SimplifiedSolver:
         }, model_path)
         print(f"模型参数已保存至: {model_path}")
 
+    def load_model(self, checkpoint_path):
+        """
+        加载预训练参数
+        :param checkpoint_path: 检查点文件路径（.pth文件）
+        """
+        # 加载检查点数据
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
 
-    # def test(self, test_loader):
-    #     self.G.eval()
-    #     self.D_di.eval()
-    #     self.C_di.eval()
-    #     correct = 0
-    #     total = 0
-    #     with torch.no_grad():
-    #         for batch_idx, batch in enumerate(test_loader):
-    #             img = batch[0].to(self.device).unsqueeze(1)
-    #             lb = batch[1].to(self.device)
-    #             feat = self.G(img)
-    #             feat_di = self.D_di(feat)
-    #             pred_logits = self.C_di(feat_di)
-    #             pred_lb = pred_logits.argmax(dim=1)
-    #             # 打印分类结果和真实标签（完整tensor，如果太长可截取如 pred_lb[:256]）
-    #             print(f"分类结果：pred_lb {pred_lb}")
-    #             print(f"真实标签：lb {lb}")
-    #             correct += (pred_lb == lb).sum().item()
-    #             total += lb.size(0)
-    #     accuracy = correct / total
-    #     print(f"Test Accuracy: {accuracy * 100:.2f}%")
+        # 恢复模型参数
+        self.G.load_state_dict(checkpoint['G_state_dict'])
+        self.D_di.load_state_dict(checkpoint['D_di_state_dict'])
+        self.D_ci.load_state_dict(checkpoint['D_ci_state_dict'])
+        self.C_di.load_state_dict(checkpoint['C_di_state_dict'])
+        self.C_ci.load_state_dict(checkpoint['C_ci_state_dict'])
+
+        # 恢复优化器状态
+        self.opt_G.load_state_dict(checkpoint['optimizer_G'])
+        self.opt_D_di.load_state_dict(checkpoint['optimizer_D_di'])
+        self.opt_D_ci.load_state_dict(checkpoint['optimizer_D_ci'])
+        self.opt_C_di.load_state_dict(checkpoint['optimizer_C_di'])
+        self.opt_C_ci.load_state_dict(checkpoint['optimizer_C_ci'])
+
+        # 切换模型为训练模式
+        self.G.train()
+        self.D_di.train()
+        self.D_ci.train()
+        self.C_di.train()
+        self.C_ci.train()
+
+        print("=== 参数已成功加载 ===")
