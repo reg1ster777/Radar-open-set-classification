@@ -12,19 +12,23 @@ import torch.optim as optim
 from tqdm import tqdm
 import os
 import os.path as osp
-from model import Feature_base, Feature_disentangle, Predictor
+from component import G_FeatureBase, D_FeatureDisentangle, C_Predictor
+from component import G_HybridFeatureBase, D_HybridFeatureDisentangle
 from datetime import datetime
 
 
 class SimplifiedSolver:
+    """
+    普通架构求解器
+    """
     def __init__(self, num_classes=7, lr=0.0000001, device="cpu"):
         self.device = device
         self.num_k = num_classes
-        self.G = Feature_base().to(self.device)
-        self.D_di = Feature_disentangle().to(self.device)
-        self.D_ci = Feature_disentangle().to(self.device)
-        self.C_di = Predictor(output_dim=num_classes).to(self.device)
-        self.C_ci = Predictor(output_dim=num_classes).to(self.device)
+        self.G = G_FeatureBase().to(self.device)
+        self.D_di = D_FeatureDisentangle().to(self.device)
+        self.D_ci = D_FeatureDisentangle().to(self.device)
+        self.C_di = C_Predictor(output_dim=num_classes).to(self.device)
+        self.C_ci = C_Predictor(output_dim=num_classes).to(self.device)
         self.opt_G = optim.Adam(self.G.parameters(), lr=lr)
         self.opt_D_di = optim.Adam(self.D_di.parameters(), lr=lr)
         self.opt_D_ci = optim.Adam(self.D_ci.parameters(), lr=lr)
@@ -152,7 +156,7 @@ class SimplifiedSolver:
 
     def save_model(self):
         """保存参数"""
-        save_path = "model"
+        save_path = "model/SimplifiedSolver"
         if not osp.exists(save_path):
             os.makedirs(save_path)
 
@@ -204,3 +208,182 @@ class SimplifiedSolver:
         self.C_ci.train()
 
         print("=== 参数已成功加载 ===")
+
+
+class HybridSolver:
+    """
+    混合架构求解器（CNN-Transformer）
+    """
+
+    def __init__(self, num_classes=7, lr=0.0001, device="cpu"):  # lr微调
+        self.device = device
+        self.num_k = num_classes
+        # --- 混合模型组件 ---
+        self.G = G_HybridFeatureBase().to(self.device)  # 使用HybridFeatureBase
+        self.D_di = D_HybridFeatureDisentangle(
+            input_dim=64).to(self.device)  # 输入维度适配为64
+        self.D_ci = D_HybridFeatureDisentangle(input_dim=64).to(self.device)
+        self.C_di = C_Predictor(
+            input_dim=64, output_dim=num_classes).to(self.device)
+        self.C_ci = C_Predictor(
+            input_dim=64, output_dim=num_classes).to(self.device)
+
+        # --- 优化器 ---
+        self.opt_G = optim.Adam(self.G.parameters(), lr=lr)
+        self.opt_D_di = optim.Adam(self.D_di.parameters(), lr=lr)
+        self.opt_D_ci = optim.Adam(self.D_ci.parameters(), lr=lr)
+        self.opt_C_di = optim.Adam(self.C_di.parameters(), lr=lr)
+        self.opt_C_ci = optim.Adam(self.C_ci.parameters(), lr=lr)
+        self.xent_loss = nn.CrossEntropyLoss().to(self.device)
+
+    def reset_grad(self):
+        """
+        重置梯度
+        """
+        self.opt_G.zero_grad()
+        self.opt_D_di.zero_grad()
+        self.opt_D_ci.zero_grad()
+        self.opt_C_di.zero_grad()
+        self.opt_C_ci.zero_grad()
+
+    def optimize_classifier(self, pred_di, pred_ci, label):
+        """
+        分类损失计算
+        """
+        loss_di = self.xent_loss(pred_di, label)
+        loss_ci = self.xent_loss(pred_ci, label)
+        return loss_di + loss_ci
+
+    def train(self, source_loader, test_loader, epochs, test=False):
+        """
+        训练过程
+        """
+        print("=== 模型架构: HybridSolver (CNN-Transformer) ===")
+        for epoch in range(epochs):
+            total_loss = 0
+            for batch in source_loader:
+                img = batch[0].to(self.device).unsqueeze(1)
+                label = batch[1].to(self.device)
+
+                # 1. 重置梯度
+                self.reset_grad()
+
+                # 2. 特征提取与解耦
+                feat_src = self.G(img)        # 混合特征提取
+                feat_di = self.D_di(feat_src)  # 域不变特征
+                feat_ci = self.D_ci(feat_src)  # 域相关特征
+                pred_di = self.C_di(feat_di)  # 分类预测
+                pred_ci = self.C_ci(feat_ci)
+
+                # 3. 计算损失
+                class_loss = self.optimize_classifier(pred_di, pred_ci, label)
+
+                # 4. 反向传播
+                class_loss.backward()
+                self.opt_G.step()
+                self.opt_D_di.step()
+                self.opt_D_ci.step()
+                self.opt_C_di.step()
+                self.opt_C_ci.step()
+                total_loss += class_loss.item()
+
+            avg_loss = total_loss / len(source_loader)
+            print(f">>> Epoch {epoch+1}/{epochs}: Avg Loss = {avg_loss:.6f}")
+            if test:
+                self.test_epoch(test_loader, epoch+1)
+
+        self.save_model()
+        print("=== 训练结束 ===")
+
+    def test_epoch(self, test_loader, epoch=None):
+        """
+        测试函数
+        """
+        self.G.eval()
+        self.D_di.eval()
+        self.D_ci.eval()
+        self.C_di.eval()
+        self.C_ci.eval()
+
+        class_correct = {}
+        class_total = {}
+
+        with torch.no_grad():
+            for batch in test_loader:
+                img = batch[0].to(self.device).unsqueeze(1)
+                label = batch[1].to(self.device)
+                feat_src = self.G(img)
+                feat_di = self.D_di(feat_src)
+                pred_di = self.C_di(feat_di)
+                pred_label = pred_di.argmax(dim=1)
+
+                for i in range(len(label)):
+                    lb = label[i].item()
+                    pred_lb = pred_label[i].item()
+                    if lb not in class_total:
+                        class_total[lb] = 0
+                        class_correct[lb] = 0
+                    class_total[lb] += 1
+                    if pred_lb == lb:
+                        class_correct[lb] += 1
+
+        total_correct = sum(class_correct.values())
+        total_samples = sum(class_total.values())
+        overall_accuracy = total_correct / total_samples
+        print(f"Overall Accuracy: {overall_accuracy * 100:.2f}%")
+        for label in sorted(class_total.keys()):
+            acc = class_correct[label] / class_total[label]
+            print(
+                f"  Class {label}: {acc * 100:.2f}% ({class_correct[label]}/{class_total[label]})")
+        print("=" * 30)
+        self.G.train()
+        self.D_di.train()
+        self.D_ci.train()
+        self.C_di.train()
+        self.C_ci.train()
+
+    def save_model(self):
+        """
+        模型保存
+        """
+        save_path = "model/HybridSolver"
+        if not osp.exists(save_path):
+            os.makedirs(save_path)
+        now_time = datetime.now()
+        timestamp = now_time.strftime("%Y%m%d_%H%M%S")
+        model_path = osp.join(save_path, f"hybrid_model_{timestamp}.pth")
+        torch.save({
+            'G_state_dict': self.G.state_dict(),
+            'D_di_state_dict': self.D_di.state_dict(),
+            'D_ci_state_dict': self.D_ci.state_dict(),
+            'C_di_state_dict': self.C_di.state_dict(),
+            'C_ci_state_dict': self.C_ci.state_dict(),
+            'optimizer_G': self.opt_G.state_dict(),
+            'optimizer_D_di': self.opt_D_di.state_dict(),
+            'optimizer_D_ci': self.opt_D_ci.state_dict(),
+            'optimizer_C_di': self.opt_C_di.state_dict(),
+            'optimizer_C_ci': self.opt_C_ci.state_dict(),
+        }, model_path)
+        print(f"混合模型参数已保存至: {model_path}")
+
+    def load_model(self, checkpoint_path):
+        """
+        加载模型
+        """
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        self.G.load_state_dict(checkpoint['G_state_dict'])
+        self.D_di.load_state_dict(checkpoint['D_di_state_dict'])
+        self.D_ci.load_state_dict(checkpoint['D_ci_state_dict'])
+        self.C_di.load_state_dict(checkpoint['C_di_state_dict'])
+        self.C_ci.load_state_dict(checkpoint['C_ci_state_dict'])
+        self.opt_G.load_state_dict(checkpoint['optimizer_G'])
+        self.opt_D_di.load_state_dict(checkpoint['optimizer_D_di'])
+        self.opt_D_ci.load_state_dict(checkpoint['optimizer_D_ci'])
+        self.opt_C_di.load_state_dict(checkpoint['optimizer_C_di'])
+        self.opt_C_ci.load_state_dict(checkpoint['optimizer_C_ci'])
+        self.G.train()
+        self.D_di.train()
+        self.D_ci.train()
+        self.C_di.train()
+        self.C_ci.train()
+        print("=== 混合模型参数已加载 ===")

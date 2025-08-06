@@ -13,7 +13,7 @@ from tqdm import tqdm
 import os
 import os.path as osp
 from dataset import ImageSet
-from solver import SimplifiedSolver
+from solver import SimplifiedSolver, HybridSolver
 
 
 if __name__ == "__main__":
@@ -28,7 +28,7 @@ if __name__ == "__main__":
 
     # 加载测试集（20%）
     dataset_test = ImageSet(known_class_path, train=False)
-    loader_test = DataLoader(dataset_test, batch_size=128, shuffle=False)
+    loader_test = DataLoader(dataset_test, batch_size=128, shuffle=True)
     print("=== 测试集加载完毕 ===")
 
     # 获取设备
@@ -36,10 +36,10 @@ if __name__ == "__main__":
     print("=== device: {} ===".format(device))
 
     # 训练模型
-    model_path = 'model\model_20250805_175559.pth'
-    solver = SimplifiedSolver(num_classes=7, device=device)
-    solver.load_model(model_path)
-    solver.train(loader_train, loader_test, epochs=500, test=True)
+    # model_path = 'model\model_20250805_175559.pth'
+    solver = HybridSolver(num_classes=7, device=device)
+    # solver.load_model(model_path)  # 导入现有模型（可选）
+    solver.train(loader_train, loader_test, epochs=100, test=True)
 
     # # 测试并打印 pred_lb 和 lb
     # print("\nTesting on known classes...")
