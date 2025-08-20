@@ -13,11 +13,11 @@ from tqdm import tqdm
 import os
 import os.path as osp
 from dataset import ImageSet
-from solver import SimplifiedSolver, HybridSolver
+from solver import solver_choose
 
 
 if __name__ == "__main__":
-    # 示例路径（替换为您的实际路径）
+    # 路径
     known_class_path = 'data/data_noise_50/known_class_7'
     open_class_path = 'data/data_noise_50/open_class_10'
 
@@ -35,19 +35,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("=== device: {} ===".format(device))
 
-    # 训练模型
     # model_path = 'model\model_20250805_175559.pth'
-    solver = HybridSolver(num_classes=7, device=device)
+    solver = solver_choose(arch_type="simplified", num_classes=7, device=device)
     # solver.load_model(model_path)  # 导入现有模型（可选）
-    solver.train(loader_train, loader_test, epochs=100, test=True)
-
-    # # 测试并打印 pred_lb 和 lb
-    # print("\nTesting on known classes...")
-    # solver.test(loader_test)
-
-    # # 可选：开集测试（使用open_class_path）
-    # dataset_open_test = ImageSet(open_class_path, train=False)
-    # loader_open_test = DataLoader(
-    #     dataset_open_test, batch_size=128, shuffle=False)
-    # print("\nTesting on open classes...")
-    # solver.test(loader_open_test)
+    solver.train(loader_train, loader_test, epochs=500, test=True)

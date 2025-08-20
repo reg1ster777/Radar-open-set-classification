@@ -16,7 +16,7 @@ from dataset import ImageSet
 from solver import SimplifiedSolver, HybridSolver
 
 if __name__ == "__main__":
-    # 示例路径（替换为您的实际路径）
+    # 路径
     known_class_path = 'data/data_noise_50/known_class_7'
     open_class_path = 'data/data_noise_50/open_class_10'
 
