@@ -12,21 +12,10 @@ except ImportError:  # pragma: no cover - optional dependency
 
 
 class ReconstructionHead(nn.Module):
-    def __init__(self, feature_dim: int, original_signal_length: int, input_channels: int = 1, compression_ratio: float = 0.25):
+    def __init__(self, feature_dim: int, original_signal_length: int, input_channels: int = 1, compression_ratio: float = 1.0):
         super().__init__()
-        # 添加压缩瓶颈：feature_dim -> compressed_dim -> feature_dim
-        compressed_dim = int(feature_dim * compression_ratio)
-
-        # 压缩编码器
-        self.encoder = nn.Sequential(
-            nn.Linear(feature_dim, compressed_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1)
-        )
-
-        # 重构解码器：从压缩特征重构完整信号
         self.decoder = nn.Sequential(
-            nn.Linear(compressed_dim, 512),
+            nn.Linear(feature_dim, 512),
             nn.ReLU(),
             nn.Linear(512, 256),
             nn.ReLU(),
@@ -35,21 +24,16 @@ class ReconstructionHead(nn.Module):
 
         self.original_signal_length = original_signal_length
         self.input_channels = input_channels
-        self.compressed_dim = compressed_dim
 
     def forward(self, x):
         # x: [batch_size, feature_dim]
 
-        # 压缩特征
-        compressed_features = self.encoder(x)  # [batch_size, compressed_dim]
-
-        # 重构完整信号
-        reconstructed_flat = self.decoder(compressed_features)
+        reconstructed_flat = self.decoder(x)
 
         # 重塑回信号的形状
         reconstructed_signal = reconstructed_flat.view(x.size(0), self.input_channels, self.original_signal_length)
 
-        return reconstructed_signal, compressed_features
+        return reconstructed_signal, x
 
 
 class LabeledReconstructionHead(nn.Module):

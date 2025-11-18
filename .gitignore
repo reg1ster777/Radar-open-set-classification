@@ -4,3 +4,5 @@ true_open_set_results_50/
 data/
 data1/
 result/
+__pycache__/
+*.pyc

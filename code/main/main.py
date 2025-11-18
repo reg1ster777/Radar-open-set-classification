@@ -22,14 +22,14 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.gcd_implementation.gcd_solver import GCDPretrainer
 from src.solver.dataset import load_radar_known_fixed_test, load_radar_unknown
 
-DATA_ROOT = "data1\data_noise_50"
+DATA_ROOT = REPO_ROOT / "data1" / "data_noise_50"
 KNOWN_CLASS_COUNT = 7
 UNKNOWN_CLASS_COUNT = 3
 TOTAL_CLASSES = KNOWN_CLASS_COUNT + UNKNOWN_CLASS_COUNT
 
-RECON_DIR = Path(__file__).resolve().parent / "reconstruction_outputs_50"
+RECON_DIR = REPO_ROOT / "result" / "MSE" / "reconstruction_outputs_50"
 RECON_DIR.mkdir(parents=True, exist_ok=True)
-OPEN_SET_DIR = Path(__file__).resolve().parent / "true_open_set_results_data1_50"
+OPEN_SET_DIR = REPO_ROOT / "result" / "MSE" / "true_open_set_results_data1_50"
 OPEN_SET_DIR.mkdir(parents=True, exist_ok=True)
 
 
