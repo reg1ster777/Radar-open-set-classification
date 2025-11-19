@@ -4,12 +4,15 @@
 import sys
 import warnings
 from pathlib import Path
+from typing import Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import umap
-from sklearn.cluster import DBSCAN
+from sklearn.cluster import KMeans
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -22,14 +25,23 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.gcd_implementation.gcd_solver import GCDPretrainer
 from src.solver.dataset import load_radar_known_fixed_test, load_radar_unknown
 
-DATA_ROOT = REPO_ROOT / "data1" / "data_noise_40"
+DATA_ROOT = REPO_ROOT / "data1" / "data_noise_30"
 KNOWN_CLASS_COUNT = 7
 UNKNOWN_CLASS_COUNT = 3
 TOTAL_CLASSES = KNOWN_CLASS_COUNT + UNKNOWN_CLASS_COUNT
 
-RECON_DIR = REPO_ROOT / "result" / "MSE" / "reconstruction_outputs_40"
+RECON_BATCH_SIZE = 256
+SUPERVISED_CONTRASTIVE_WEIGHT = 1.0
+SUPERVISED_CONTRASTIVE_TEMPERATURE = 0.2
+SUPERVISED_CE_WEIGHT = 1.0
+SUPERVISED_EPOCHS = 15
+SUPERVISED_BATCH_SIZE = 128
+SUPERVISED_LR = 1e-4
+FREEZE_BACKBONE_IN_SUP = False
+
+RECON_DIR = REPO_ROOT / "result" / "MIX" / "reconstruction_outputs_30"
 RECON_DIR.mkdir(parents=True, exist_ok=True)
-OPEN_SET_DIR = REPO_ROOT / "result" / "MSE" / "true_open_set_results_data1_40"
+OPEN_SET_DIR = REPO_ROOT / "result" / "MIX" / "true_open_set_results_data1_30"
 OPEN_SET_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -63,7 +75,7 @@ def plot_umap_open_set(embeddings, true_labels, cluster_labels, save_dir=None):
     unique_clusters = np.unique(cluster_labels)
     cluster_colors = plt.cm.tab20(np.linspace(0, 1, len(unique_clusters)))
 
-    # 子图 (0,1)：展示 DBSCAN 聚类，并单独标出噪声点以查看离群。
+    # 子图 (0,1)：展示 KMeans 聚类；若算法输出噪声标签亦会单独标记。
     for i, cluster_id in enumerate(unique_clusters):
         if cluster_id == -1:
             mask = cluster_labels == cluster_id
@@ -75,7 +87,7 @@ def plot_umap_open_set(embeddings, true_labels, cluster_labels, save_dir=None):
                                c=[cluster_colors[i]], s=20, alpha=0.7,
                                label=f'Cluster {cluster_id}')
 
-    axes[0, 1].set_title('DBSCAN Clustering Results', fontsize=12, fontweight='bold')
+    axes[0, 1].set_title('KMeans Clustering Results', fontsize=12, fontweight='bold')
     axes[0, 1].set_xlabel('UMAP 1')
     axes[0, 1].set_ylabel('UMAP 2')
     axes[0, 1].legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
@@ -187,13 +199,165 @@ def create_open_set_dataset():
     return dataset
 
 
-def build_pretraining_loader(signals: torch.Tensor, batch_size: int = 256) -> DataLoader:
-    # 自编码式预训练以重构为目标，输入与标签完全一致。
-    dataset = TensorDataset(signals, signals, signals)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=True)
+def ensure_channel_dim(signals: torch.Tensor) -> torch.Tensor:
+    """确保输入含有 [B, C, L] 形状，如果缺少通道维则补齐。"""
+    if signals.dim() == 2:
+        return signals.unsqueeze(1)
+    return signals
 
 
-def train_feature_extractor(signals: torch.Tensor, device: torch.device, epochs: int = 20) -> GCDPretrainer:
+def build_supervised_loader(signals: torch.Tensor, labels: torch.Tensor, batch_size: int = 256, shuffle: bool = True) -> DataLoader:
+    """构建用于监督分类的 DataLoader。"""
+    dataset = TensorDataset(signals, labels)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+
+
+@torch.no_grad()
+def evaluate_classifier(backbone: nn.Module, classifier: nn.Module, dataloader: DataLoader, device: torch.device) -> float:
+    """在指定数据集上评估分类准确率。"""
+    backbone.eval()
+    classifier.eval()
+    correct = 0
+    total = 0
+    for signals, labels in dataloader:
+        signals = signals.to(device)
+        labels = labels.to(device)
+        logits = classifier(backbone(signals))
+        preds = torch.argmax(logits, dim=1)
+        correct += (preds == labels).sum().item()
+        total += labels.size(0)
+    return correct / total if total > 0 else 0.0
+
+
+def train_supervised_classifier(
+    pretrainer: GCDPretrainer,
+    train_signals: torch.Tensor,
+    train_labels: torch.Tensor,
+    val_signals: torch.Tensor,
+    val_labels: torch.Tensor,
+    device: torch.device,
+    num_classes: int,
+    *,
+    batch_size: int = 128,
+    epochs: int = 15,
+    lr: float = 1e-4,
+    freeze_backbone: bool = False,
+) -> Tuple[nn.Module, dict]:
+    """使用交叉熵在已知类别上训练一个分类头。"""
+    backbone = pretrainer.backbone
+    train_loader = build_supervised_loader(train_signals, train_labels, batch_size=batch_size, shuffle=True)
+    val_loader = build_supervised_loader(val_signals, val_labels, batch_size=batch_size, shuffle=False)
+
+    # 推理一次确定 backbone 的输出维度。
+    feature_dim = backbone(train_signals[:1].to(device)).shape[1]
+    classifier = nn.Linear(feature_dim, num_classes).to(device)
+
+    if freeze_backbone:
+        for param in backbone.parameters():
+            param.requires_grad = False
+        optimizer = torch.optim.Adam(classifier.parameters(), lr=lr)
+    else:
+        optimizer = torch.optim.Adam(
+            list(backbone.parameters()) + list(classifier.parameters()), lr=lr
+        )
+
+    criterion = nn.CrossEntropyLoss()
+    history = {"train_loss": [], "val_acc": []}
+    best_state = None
+    best_val_acc = 0.0
+
+    for epoch in range(epochs):
+        backbone.train()
+        classifier.train()
+        running_loss = 0.0
+        steps = 0
+        for signals, labels in train_loader:
+            signals = signals.to(device)
+            labels = labels.to(device)
+            logits = classifier(backbone(signals))
+            loss = criterion(logits, labels)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item()
+            steps += 1
+
+        avg_loss = running_loss / max(steps, 1)
+        val_acc = evaluate_classifier(backbone, classifier, val_loader, device)
+        history["train_loss"].append(avg_loss)
+        history["val_acc"].append(val_acc)
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_state = classifier.state_dict()
+
+        print(f"[Supervised] Epoch {epoch + 1}/{epochs} - loss={avg_loss:.4f}  val_acc={val_acc:.4f}")
+
+    if best_state is not None:
+        classifier.load_state_dict(best_state)
+    history["best_val_acc"] = best_val_acc
+    return classifier, history
+
+
+def supervised_contrastive_loss(features: torch.Tensor, labels: torch.Tensor, temperature: float) -> torch.Tensor:
+    """有标签对比损失：同类样本互为正样本。"""
+    device = features.device
+    batch_size = features.shape[0]
+    if batch_size <= 1:
+        return torch.tensor(0.0, device=device)
+
+    features = F.normalize(features, dim=1)
+    similarity = torch.matmul(features, features.T) / temperature
+    similarity = similarity - torch.max(similarity, dim=1, keepdim=True)[0].detach()
+
+    logits_mask = torch.ones_like(similarity, device=device) - torch.eye(batch_size, device=device)
+    similarity = similarity * logits_mask + (-1e9) * (1 - logits_mask)
+
+    exp_logits = torch.exp(similarity)
+    log_prob = similarity - torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-12)
+
+    labels = labels.contiguous().view(-1, 1)
+    positive_mask = torch.eq(labels, labels.T).float().to(device)
+    positive_mask = positive_mask * logits_mask
+
+    positive_count = positive_mask.sum(dim=1)
+    valid = positive_count > 0
+    if valid.sum() == 0:
+        return torch.tensor(0.0, device=device)
+
+    mean_log_prob_pos = (positive_mask * log_prob).sum(dim=1) / (positive_count + 1e-12)
+    loss = -mean_log_prob_pos[valid].mean()
+    return loss
+
+
+def prototype_cross_entropy(features: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """使用 batch 内类均值作为原型的交叉熵，不引入显式分类头。"""
+    device = features.device
+    unique_labels, mapped = torch.unique(labels, sorted=True, return_inverse=True)
+    class_count = unique_labels.size(0)
+    if class_count <= 1:
+        return torch.tensor(0.0, device=device)
+
+    prototypes = torch.zeros(class_count, features.size(1), device=device)
+    prototypes.index_add_(0, mapped, features)
+    counts = torch.zeros(class_count, device=device)
+    counts.index_add_(0, mapped, torch.ones_like(mapped, dtype=torch.float32))
+    prototypes = prototypes / counts.unsqueeze(1)
+
+    logits = features @ prototypes.T
+    ce_loss = F.cross_entropy(logits, mapped)
+    return ce_loss
+
+
+def train_feature_extractor(
+    signals: torch.Tensor,
+    labels: torch.Tensor,
+    device: torch.device,
+    epochs: int = 20,
+    contrastive_weight: float = SUPERVISED_CONTRASTIVE_WEIGHT,
+    ce_weight: float = SUPERVISED_CE_WEIGHT,
+) -> GCDPretrainer:
     # 根据信号长度和通道数配置 backbone，确保尺寸匹配。
     signal_length = signals.shape[-1]
     channels = signals.shape[1]
@@ -206,12 +370,48 @@ def train_feature_extractor(signals: torch.Tensor, device: torch.device, epochs:
         lr=1e-4,
         compression_ratio=0.25,
     )
-    # 使用 DataLoader 对原始张量分批重构训练。
-    dataloader = build_pretraining_loader(signals)
-    # 运行若干轮自监督重构，预热 backbone。
+
+    dataset = TensorDataset(signals, labels)
+    dataloader = DataLoader(dataset, batch_size=RECON_BATCH_SIZE, shuffle=True)
+
     for epoch in range(epochs):
-        loss = pretrainer.train_epoch(dataloader)
-        print(f"Epoch {epoch + 1}/{epochs} - Reconstruction Loss: {loss:.6f}")
+        pretrainer.backbone.train()
+        pretrainer.reconstruction_head.train()
+
+        recon_running = 0.0
+        contrast_running = 0.0
+        ce_running = 0.0
+        steps = 0
+
+        for batch_signals, batch_labels in dataloader:
+            batch_signals = batch_signals.to(device)
+            batch_labels = batch_labels.to(device)
+
+            pretrainer.optimizer.zero_grad()
+
+            features = pretrainer.backbone(batch_signals)
+            reconstructed_signal, _ = pretrainer.reconstruction_head(features)
+            recon_loss = pretrainer.criterion(reconstructed_signal, batch_signals)
+
+            sup_contrast_loss = supervised_contrastive_loss(
+                features, batch_labels, SUPERVISED_CONTRASTIVE_TEMPERATURE
+            )
+
+            ce_loss = prototype_cross_entropy(features, batch_labels)
+
+            loss = recon_loss + contrastive_weight * sup_contrast_loss + ce_weight * ce_loss
+            loss.backward()
+            pretrainer.optimizer.step()
+
+            recon_running += recon_loss.item()
+            contrast_running += sup_contrast_loss.item()
+            ce_running += ce_loss.item()
+            steps += 1
+
+        recon_avg = recon_running / max(steps, 1)
+        contrast_avg = contrast_running / max(steps, 1)
+        ce_avg = ce_running / max(steps, 1)
+        print(f"Epoch {epoch + 1}/{epochs} - Recon={recon_avg:.6f}  SupCon={contrast_avg:.6f}  CE={ce_avg:.6f}")
     return pretrainer
 
 
@@ -328,14 +528,12 @@ def evaluate_open_set(pretrainer: GCDPretrainer, device: torch.device, dataset):
     embeddings = umap_reducer.fit_transform(test_features)
     print(f"UMAP降维完成: {embeddings.shape}")
 
-    print("\n=== 7. DBSCAN聚类 ===")
-    # 直接在特征空间聚类，DBSCAN 会把噪声样本标为 -1。
-    dbscan = DBSCAN(eps=0.15, min_samples=7)
-    cluster_labels = dbscan.fit_predict(test_features)
+    print("\n=== 7. KMeans聚类 ===")
+    # 使用 KMeans 聚类，目标团簇数为已知+未知全部类别。
+    kmeans = KMeans(n_clusters=TOTAL_CLASSES, n_init=10, random_state=42)
+    cluster_labels = kmeans.fit_predict(test_features)
     unique_clusters = np.unique(cluster_labels)
-    noise_count = np.sum(cluster_labels == -1)
-    print(f"发现聚类数量: {len(unique_clusters) - (1 if -1 in unique_clusters else 0)}")
-    print(f"噪声点数量: {noise_count} ({noise_count/len(cluster_labels)*100:.1f}%)")
+    print(f"KMeans 聚类数量: {len(unique_clusters)}")
 
     print("\n=== 8. 开集性能分析 ===")
     # 按已知/未知拆分评估指标并分别输出。
@@ -425,7 +623,7 @@ def compute_confusion_metrics(confusion_matrix: np.ndarray):
     unknown_correct = sum(confusion_matrix[KNOWN_CLASS_COUNT + i, KNOWN_CLASS_COUNT + i] for i in range(UNKNOWN_CLASS_COUNT))
     unknown_accuracy = unknown_correct / unknown_total if unknown_total > 0 else 0.0
 
-    # 噪声占比反映有多少样本被 DBSCAN 判为离群。
+    # 噪声占比用来衡量聚类算法未归属的样本比例（KMeans 通常为 0）。
     noise_total = confusion_matrix[:, -1].sum()
     noise_ratio = noise_total / total_samples if total_samples > 0 else 0.0
 
@@ -506,7 +704,7 @@ def main():
 
     print("\n=== 3. 自监督预训练 ===")
     # 训练 backbone + 重构头
-    pretrainer = train_feature_extractor(train_signals, device)  
+    pretrainer = train_feature_extractor(train_signals, train_labels, device)  
 
     # 针对每个类别取前 10 条样本，展示原始 vs 重构对比
     # 在执行开放集评估前，先导出每类的重构对比图。
@@ -518,7 +716,7 @@ def main():
         samples_per_class=10,
     )
 
-    # 使用预训练 backbone 提特征，并完成 UMAP+DBSCAN 的开集分析
+    # 使用预训练 backbone 提特征，并完成 UMAP+KMeans 的开集分析
     # 对合并后的测试集执行聚类与指标计算流程。
     evaluate_open_set(pretrainer, device, dataset)
 
